@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
   merge_group:
     types: [checks_requested]
@@ -38,7 +39,7 @@ jobs:
       - name: Generate matrix JSON from tox -l
         id: gen
         run: |
-          uvx --with tox-uv tox -l | python scripts/tox_matrix.py >> "$GITHUB_OUTPUT"
+          uvx --with tox-uv tox -l | grep 'instrumentation-genai-openai' | python scripts/tox_matrix.py >> "$GITHUB_OUTPUT"
 
   misc:
     uses: $/.github/workflows/misc.yml
