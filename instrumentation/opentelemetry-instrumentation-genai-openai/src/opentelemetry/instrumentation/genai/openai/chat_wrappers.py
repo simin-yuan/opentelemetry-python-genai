@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from typing import Any
 
 from openai import AsyncStream, Stream
 from openai.types import CompletionUsage
@@ -17,6 +20,8 @@ from opentelemetry.util.genai.invocation import InferenceInvocation
 from opentelemetry.util.genai.stream import (
     AsyncStreamWrapper,
     SyncStreamWrapper,
+    finalize_on_aclose,
+    finalize_on_close,
 )
 from opentelemetry.util.genai.types import (
     OutputMessage,
@@ -43,6 +48,13 @@ class _ChatStreamMixin:
     _self_response_id: str | None
     _self_service_tier: str | None
     _self_usage: CompletionUsage | None
+    # Supplied by the Sync/AsyncStreamWrapper base classes.
+    _self_stream: Any
+    _finalize_success: Callable[[], None]
+    _execution_context: Callable[[], AbstractContextManager[None]]
+    # Memoized so ``stream.response`` stays the same object on every
+    # access, the way the unwrapped response does.
+    _self_response_proxy: Any
 
     def _set_response_model(self, chunk: ChatCompletionChunk) -> None:
         # Set eagerly so the per-chunk streaming timing metrics carry
@@ -207,6 +219,23 @@ class ChatStreamWrapper(
         self._self_response_id = None
         self._self_service_tier = None
         self._self_usage = None
+        self._self_response_proxy = None
+
+    @property
+    def response(self) -> Any:
+        # ``chat.completions.stream()`` hands the caller a manager whose
+        # ``close()`` closes this HTTP response rather than the stream we
+        # wrap, so a caller that leaves the ``with`` block early would
+        # otherwise finalize only from ``__del__`` (as an abandoned stream,
+        # recorded with an error). Finalize here instead: closing the
+        # response means the caller is done with the stream.
+        if self._self_response_proxy is None:
+            self._self_response_proxy = finalize_on_close(
+                self._self_stream.response,
+                self._finalize_success,
+                execution_context=self._execution_context,
+            )
+        return self._self_response_proxy
 
 
 class AsyncChatStreamWrapper(
@@ -227,6 +256,20 @@ class AsyncChatStreamWrapper(
         self._self_response_id = None
         self._self_service_tier = None
         self._self_usage = None
+        self._self_response_proxy = None
+
+    @property
+    def response(self) -> Any:
+        # ``async with client.chat.completions.stream()`` closes the HTTP
+        # response, not the stream we wrap; finalize on that close so an early
+        # exit does not wait for ``__del__``.
+        if self._self_response_proxy is None:
+            self._self_response_proxy = finalize_on_aclose(
+                self._self_stream.response,
+                self._finalize_success,
+                execution_context=self._execution_context,
+            )
+        return self._self_response_proxy
 
 
 __all__ = [
