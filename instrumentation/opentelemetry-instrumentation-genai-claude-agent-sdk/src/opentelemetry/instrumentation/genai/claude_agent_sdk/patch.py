@@ -21,6 +21,7 @@ from typing import Any, cast
 
 from wrapt import FunctionWrapper
 
+from opentelemetry import trace
 from opentelemetry.util.genai.handler import TelemetryHandler
 from opentelemetry.util.genai.stream import AsyncStreamWrapper
 from opentelemetry.util.genai.types import OutputMessage, TextPart
@@ -33,6 +34,58 @@ PROVIDER = "anthropic"
 _ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "claude_agent_sdk_instrumented", default=False
 )
+
+# In-process SDK MCP tools: tool name -> server instance, plus the invocation of
+# the turn currently in flight for each server instance. The SDK calls MCP
+# handlers from its read loop, a task created at connect time, so the OTel
+# context there never holds the agent span; the span is looked up per server and
+# passed explicitly as the parent instead.
+_MCP_TOOL_SERVERS: dict[str, Any] = {}
+_SERVER_TURNS: dict[int, Any] = {}
+
+
+def _server_for_tool(name: str) -> Any:
+    """Server owning a tool. Accepts both the declared and the mcp__x__y form."""
+    if name in _MCP_TOOL_SERVERS:
+        return _MCP_TOOL_SERVERS[name]
+    if name.startswith("mcp__"):
+        return _MCP_TOOL_SERVERS.get(name.split("__")[-1])
+    return None
+
+
+def _is_in_process_tool(name: str) -> bool:
+    """Only the stream form needs suppressing; the handler is already traced."""
+    return name.startswith("mcp__") and _server_for_tool(name) is not None
+
+
+def _server_instances(options: Any) -> list[Any]:
+    servers = getattr(options, "mcp_servers", None) or {}
+    instances = []
+    for config in servers.values():
+        instance = config.get("instance") if isinstance(config, dict) else config
+        if instance is not None:
+            instances.append(instance)
+    return instances
+
+
+def _register_turn(options: Any, invocation: Any) -> None:
+    for instance in _server_instances(options):
+        _SERVER_TURNS[id(instance)] = invocation
+
+
+def _clear_turn(options: Any) -> None:
+    for instance in _server_instances(options):
+        _SERVER_TURNS.pop(id(instance), None)
+
+
+def _tool_parent_context(tool_name: str) -> Any:
+    server = _server_for_tool(tool_name)
+    if server is None:
+        return None
+    span = getattr(_SERVER_TURNS.get(id(server)), "span", None)
+    if span is None:
+        return None
+    return trace.set_span_in_context(span)
 
 
 def _usage_of(message: Any) -> dict[str, Any]:
@@ -61,8 +114,10 @@ class ClaudeAgentStreamWrapper(AsyncStreamWrapper[Any]):
         stream: Any,
         invocation: Any,
         handler: TelemetryHandler,
+        turn_options: Any = None,
     ) -> None:
         super().__init__(stream, invocation)
+        self._self_turn_options = turn_options
         # Output accumulation lives here rather than in a shared helper: the base
         # wrapper only scopes the invocation, it does not know about agent output.
         self._self_out_parts: list[str] = []
@@ -128,6 +183,10 @@ class ClaudeAgentStreamWrapper(AsyncStreamWrapper[Any]):
         tool_id = getattr(block, "id", None)
         name = getattr(block, "name", None) or "unknown"
         if not tool_id:
+            return
+        if _is_in_process_tool(name):
+            # Instrumented at the handler; recording the observed interval too
+            # would produce two execute_tool spans for one call.
             return
         # Observed interval only: the tool runs inside the CLI, so the span
         # covers tool_use -> tool_result, not the tool's own execution time.
@@ -198,6 +257,7 @@ class ClaudeAgentStreamWrapper(AsyncStreamWrapper[Any]):
         self._apply_usage()
         self._finalize_pending_tools()
         self._apply_output()
+        _clear_turn(self._self_turn_options)
         self._self_agent.stop()
 
     def _on_stream_end(self) -> None:
@@ -207,6 +267,7 @@ class ClaudeAgentStreamWrapper(AsyncStreamWrapper[Any]):
         self._apply_usage()
         self._finalize_pending_tools(error)
         self._apply_output()
+        _clear_turn(self._self_turn_options)
         self._self_agent.fail(error)
 
 
@@ -224,7 +285,10 @@ def _wrap_query(handler: TelemetryHandler) -> Any:
             agent_name=getattr(options, "agent_name", None)
             or "claude-agent-sdk",
         )
-        return ClaudeAgentStreamWrapper(stream, invocation, handler)
+        _register_turn(options, invocation)
+        return ClaudeAgentStreamWrapper(
+            stream, invocation, handler, turn_options=options
+        )
 
     return wrapper
 
@@ -264,7 +328,10 @@ async def _multi_turn_messages(
                     request_model=getattr(options, "model", None),
                     agent_name="claude-agent-sdk",
                 )
-                wrapper = ClaudeAgentStreamWrapper(aiter, invocation, handler)
+                _register_turn(options, invocation)
+                wrapper = ClaudeAgentStreamWrapper(
+                    aiter, invocation, handler, turn_options=options
+                )
             wrapper._process_chunk(chunk)
             yield chunk
             if wrapper._self_turn_done:
@@ -306,10 +373,92 @@ def _wrap_client_iterator(handler: TelemetryHandler) -> Any:
     return wrapper
 
 
+def _wrap_tool_decorator(handler: TelemetryHandler) -> Any:
+    """SDK MCP tools run in this process, so their real duration is observable."""
+
+    def wrapper(
+        wrapped: Any,
+        instance: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        decorator = wrapped(*args, **kwargs)
+        tool_name = args[0] if args else kwargs.get("name", "unknown")
+
+        def decorator_wrapper(func: Any) -> Any:
+            async def traced(*call_args: Any, **call_kwargs: Any) -> Any:
+                # The SDK runs handlers from its read loop, which holds no agent
+                # span, so the parent is looked up per server and passed in.
+                invocation = handler.tool(
+                    name=tool_name,
+                    tool_type="function",
+                    context=_tool_parent_context(tool_name),
+                )
+                try:
+                    result = await func(*call_args, **call_kwargs)
+                except BaseException as error:
+                    invocation.fail(error)
+                    raise
+                invocation.stop()
+                return result
+
+            return decorator(traced)
+
+        return decorator_wrapper
+
+    return wrapper
+
+
+def _wrap_mcp_server() -> Any:
+    """Remember which server each in-process tool belongs to."""
+
+    def wrapper(
+        wrapped: Any,
+        instance: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        config = wrapped(*args, **kwargs)
+        server = config.get("instance") if isinstance(config, dict) else None
+        if server is None:
+            return config
+        passed = list(kwargs.get("tools") or [])
+        for value in args:
+            if isinstance(value, (list, tuple)):
+                passed.extend(value)
+        for sdk_tool in passed:
+            name = getattr(sdk_tool, "name", None)
+            if name:
+                _MCP_TOOL_SERVERS[name] = server
+        return config
+
+    return wrapper
+
+
 def instrument(handler: TelemetryHandler) -> None:
     for module_name in ("claude_agent_sdk.query", "claude_agent_sdk"):
         _patch(module_name, "query", handler)
     client = importlib.import_module("claude_agent_sdk")
+    original_tool = getattr(client, "tool", None)
+    if original_tool is not None and not isinstance(
+        original_tool, FunctionWrapper
+    ):
+        setattr(
+            client,
+            "tool",
+            FunctionWrapper(original_tool, _wrap_tool_decorator(handler)),
+        )
+        _PATCHED.append((client, "tool", original_tool))
+    original_server = getattr(client, "create_sdk_mcp_server", None)
+    if original_server is not None and not isinstance(
+        original_server, FunctionWrapper
+    ):
+        setattr(
+            client,
+            "create_sdk_mcp_server",
+            FunctionWrapper(original_server, _wrap_mcp_server()),
+        )
+        _PATCHED.append((client, "create_sdk_mcp_server", original_server))
     for attr in ("receive_response", "receive_messages"):
         original = getattr(client.ClaudeSDKClient, attr)
         if isinstance(original, FunctionWrapper):
@@ -323,6 +472,8 @@ def instrument(handler: TelemetryHandler) -> None:
 
 
 def uninstrument() -> None:
+    _MCP_TOOL_SERVERS.clear()
+    _SERVER_TURNS.clear()
     while _PATCHED:
         module, attr, original = _PATCHED.pop()
         setattr(module, attr, original)
