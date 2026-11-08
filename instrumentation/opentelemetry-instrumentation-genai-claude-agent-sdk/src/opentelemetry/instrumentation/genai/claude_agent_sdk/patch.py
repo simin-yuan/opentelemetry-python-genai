@@ -62,7 +62,9 @@ def _server_instances(options: Any) -> list[Any]:
     servers = getattr(options, "mcp_servers", None) or {}
     instances = []
     for config in servers.values():
-        instance = config.get("instance") if isinstance(config, dict) else config
+        instance = (
+            config.get("instance") if isinstance(config, dict) else config
+        )
         if instance is not None:
             instances.append(instance)
     return instances
